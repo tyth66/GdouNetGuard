@@ -24,6 +24,7 @@ func main() {
 	}
 
 	campus.RotateIfNeeded(cfg.LogFile, cfg.LogMaxSize, cfg.LogMaxBackups)
+	campus.CleanupOldLogs(cfg.LogFile, cfg.LogMaxAge)
 
 	var logger *log.Logger
 	if cfg.LogFile != "" {
@@ -32,8 +33,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "cannot open log file %s: %v\n", cfg.LogFile, err)
 			os.Exit(1)
 		}
-		defer rw.Close()
-		logger = log.New(rw, "", log.LstdFlags)
+		dw := campus.NewDedupWriter(rw)
+		defer dw.Close()
+		logger = log.New(dw, "", log.LstdFlags)
 	} else {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
@@ -67,6 +69,11 @@ func main() {
 			}
 		}
 		logger.Printf("credentials saved with Windows DPAPI: %s", store.Path())
+		if err := campus.SaveConfigFile(cfg, cfg.ConfigFile); err != nil {
+			logger.Printf("config save failed: %v", err)
+		} else {
+			logger.Printf("config saved: %s", cfg.ConfigFile)
+		}
 		return
 	}
 	if cfg.DisableStartup {
@@ -81,9 +88,17 @@ func main() {
 			logger.Fatal(err)
 		}
 		logger.Printf("startup task enabled: %s", cfg.StartupTaskName)
+		if err := campus.SaveConfigFile(cfg, cfg.ConfigFile); err != nil {
+			logger.Printf("config save failed: %v", err)
+		} else {
+			logger.Printf("config saved: %s", cfg.ConfigFile)
+		}
 		return
 	}
 	if cfg.Background {
+		if err := campus.SaveConfigFile(cfg, cfg.ConfigFile); err != nil {
+			logger.Printf("config save failed: %v", err)
+		}
 		if err := campus.StartBackground(cfg); err != nil {
 			logger.Fatal(err)
 		}
@@ -128,6 +143,11 @@ func main() {
 		} else {
 			logger.Printf("credentials auto-saved to %s", store.Path())
 		}
+	}
+
+	// Save effective config for future runs (background, startup, etc).
+	if err := campus.SaveConfigFile(cfg, cfg.ConfigFile); err != nil {
+		logger.Printf("config save failed: %v", err)
 	}
 
 	credLoader := func() (*campus.Credentials, error) {

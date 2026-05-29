@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // RotatingWriter is an io.WriteCloser that automatically rotates the underlying
@@ -64,6 +65,26 @@ func (w *RotatingWriter) Close() error {
 	return nil
 }
 
+// CurrentSize returns the current file size in bytes, or 0 on error.
+func (w *RotatingWriter) CurrentSize() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	info, err := w.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// TruncateTo truncates the underlying log file to size bytes.
+// It uses os.Truncate on the file path so that append-mode semantics
+// are not affected by the open file handle.
+func (w *RotatingWriter) TruncateTo(size int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return os.Truncate(w.path, size)
+}
+
 // RotateIfNeeded performs a one-shot rotation check. It is intended for
 // startup-time use before the RotatingWriter is constructed, so that
 // size-triggered rotation happens at startup and runtime.
@@ -90,4 +111,23 @@ func rotateBatch(path string, maxBackups int) {
 
 func itoa(n int) string {
 	return fmt.Sprintf("%d", n)
+}
+
+// CleanupOldLogs removes rotated log files (path.1, path.2, ...) that are
+// older than maxAge. The current log file at path is never removed.
+func CleanupOldLogs(path string, maxAge time.Duration) {
+	if maxAge <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for i := 1; ; i++ {
+		rotated := path + "." + itoa(i)
+		info, err := os.Stat(rotated)
+		if err != nil {
+			break // no more rotated files
+		}
+		if info.ModTime().Before(cutoff) {
+			os.Remove(rotated)
+		}
+	}
 }

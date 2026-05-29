@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -16,12 +15,6 @@ import (
 // The caller must invoke creds.Clear() when the credentials are no longer needed.
 type CredentialLoader func() (*Credentials, error)
 
-// httpClient wraps HTTP configuration shared across portal requests.
-type httpClient struct {
-	baseURL string
-	http    *http.Client
-}
-
 // Guard monitors campus network status and performs automatic re-authentication.
 type Guard struct {
 	cfg              Config
@@ -29,7 +22,7 @@ type Guard struct {
 	credentialSource string
 	hasCreds         bool
 	probeFailCount   int
-	portal           *httpClient
+	portal           *portalClient
 }
 
 // NewGuard creates a new Guard instance.
@@ -39,15 +32,7 @@ func NewGuard(cfg Config, credLoader CredentialLoader, credSource string, hasCre
 		credLoader:       credLoader,
 		credentialSource: credSource,
 		hasCreds:         hasCreds,
-		portal: &httpClient{
-			baseURL: cfg.BaseURL,
-			http: &http.Client{
-				Timeout: cfg.Timeout,
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			},
-		},
+		portal:           newPortalClient(cfg.BaseURL, cfg.Timeout),
 	}
 }
 
@@ -56,54 +41,85 @@ func (g *Guard) HasCreds() bool {
 	return g.hasCreds
 }
 
+// probeContext returns a context with the probe timeout applied.
+func (g *Guard) probeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, g.cfg.ProbeTimeout)
+}
+
 // EnsureConnected checks campus status and performs login if needed.
 func (g *Guard) EnsureConnected(ctx context.Context, logger *log.Logger) error {
-	online, onlineInfo, err := campusOnline(ctx, g.portal)
+	pctx, cancel := g.probeContext(ctx)
+	online, onlineInfo, err := g.portal.campusOnline(pctx)
+	cancel()
+
 	if err != nil {
-		logger.Printf("campus status unavailable: %v", err)
-		if g.cfg.SSID != "" {
-			if reconnectErr := reconnectWLAN(g.cfg.SSID, logger); reconnectErr != nil {
-				if isProfileNotFound(reconnectErr) {
-					logger.Printf("*** WLAN profile %q not found \u2014 reconnect once to this WiFi in Windows to restore the profile ***", g.cfg.SSID)
-				} else {
-					logger.Printf("wlan reconnect failed: %v", reconnectErr)
-				}
-			}
-			// DHCP and portal may need time after a WLAN reconnect
-			time.Sleep(5 * time.Second)
-			online, onlineInfo, retryErr := campusOnline(ctx, g.portal)
-			if retryErr != nil {
-				time.Sleep(3 * time.Second)
-				online, onlineInfo, retryErr = campusOnline(ctx, g.portal)
-				if retryErr != nil {
-					logger.Printf("campus still unavailable after reconnect+retry: %v", retryErr)
-					return retryErr
-				}
-			}
-			if online {
-				if internetReachable(ctx, g.portal, g.cfg.ProbeURL, g.cfg.ProbeContains) {
-					g.probeFailCount = 0
-					logger.Printf("online; campus_ip=%s user=%s", firstNonEmpty(onlineInfo.OnlineIP, onlineInfo.ClientIP), onlineInfo.UserName)
-					return nil
-				}
-				return g.handleProbeFail(ctx, logger, onlineInfo)
-			}
-		} else {
-			return err
-		}
-	} else if online {
-		if internetReachable(ctx, g.portal, g.cfg.ProbeURL, g.cfg.ProbeContains) {
-			g.probeFailCount = 0
-			logger.Printf("online; campus_ip=%s user=%s", firstNonEmpty(onlineInfo.OnlineIP, onlineInfo.ClientIP), onlineInfo.UserName)
-			return nil
-		}
-		return g.handleProbeFail(ctx, logger, onlineInfo)
+		return g.handleUnreachable(ctx, logger, err)
+	}
+	if online {
+		return g.handleOnline(ctx, logger, onlineInfo)
+	}
+	return g.handleOffline(ctx, logger)
+}
+
+// handleUnreachable reacts to a campusOnline probe error. When a WLAN SSID is
+// configured it attempts a netsh reconnect followed by up to two retries.
+func (g *Guard) handleUnreachable(ctx context.Context, logger *log.Logger, probeErr error) error {
+	logger.Printf("campus status unavailable: %v", probeErr)
+	if g.cfg.SSID == "" {
+		return probeErr
 	}
 
+	if reconnectErr := reconnectWLAN(g.cfg.SSID, logger); reconnectErr != nil {
+		if isProfileNotFound(reconnectErr) {
+			logger.Printf("*** WLAN profile %q not found \u2014 reconnect once to this WiFi in Windows to restore the profile ***", g.cfg.SSID)
+		} else {
+			logger.Printf("wlan reconnect failed: %v", reconnectErr)
+		}
+	}
+
+	// DHCP and portal may need time after a WLAN reconnect
+	time.Sleep(5 * time.Second)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		pctx, cancel := g.probeContext(ctx)
+		online, onlineInfo, retryErr := g.portal.campusOnline(pctx)
+		cancel()
+		if retryErr != nil {
+			continue
+		}
+		if online {
+			return g.handleOnline(ctx, logger, onlineInfo)
+		}
+		return g.handleOffline(ctx, logger)
+	}
+
+	return fmt.Errorf("campus still unreachable after WLAN reconnect: %w", probeErr)
+}
+
+// handleOnline reacts to a positive campusOnline result. It verifies actual
+// internet connectivity via the probe URL and delegates to handleProbeFail on
+// repeated failures.
+func (g *Guard) handleOnline(ctx context.Context, logger *log.Logger, onlineInfo userInfoResponse) error {
+	pctx, cancel := g.probeContext(ctx)
+	reachable := g.portal.internetReachable(pctx, g.cfg.ProbeURL, g.cfg.ProbeContains)
+	cancel()
+	if reachable {
+		g.probeFailCount = 0
+		logger.Printf("online; campus_ip=%s user=%s", firstNonEmpty(onlineInfo.OnlineIP, onlineInfo.ClientIP), onlineInfo.UserName)
+		return nil
+	}
+	return g.handleProbeFail(ctx, logger, onlineInfo)
+}
+
+// handleOffline reacts to a negative campusOnline result (portal reachable but
+// user is not logged in). It triggers a full login when credentials are available.
+func (g *Guard) handleOffline(ctx context.Context, logger *log.Logger) error {
 	if !g.hasCreds {
 		return errors.New("no credentials available; set CAMPUS_USERNAME and CAMPUS_PASSWORD, or run -save-credentials first")
 	}
-
 	g.probeFailCount = 0
 	return g.DoLogin(ctx, logger)
 }
@@ -120,7 +136,7 @@ func (g *Guard) Reauth(ctx context.Context, logger *log.Logger) error {
 	}
 	defer creds.Clear()
 
-	ip, err := detectClientIP(ctx, g.portal, g.cfg.ACID, creds.Username)
+	ip, err := g.portal.detectClientIP(ctx, g.cfg.ACID, creds.Username)
 	if err != nil {
 		return fmt.Errorf("reauth: detect IP: %w", err)
 	}
@@ -129,7 +145,7 @@ func (g *Guard) Reauth(ctx context.Context, logger *log.Logger) error {
 	}
 
 	logger.Printf("reauth: logging out (ip=%s)", ip)
-	if err := portalLogout(ctx, g.portal, creds.Username+g.cfg.Domain, ip, g.cfg.ACID); err != nil {
+	if err := g.portal.portalLogout(ctx, creds.Username+g.cfg.Domain, ip, g.cfg.ACID); err != nil {
 		logger.Printf("reauth: logout failed: %v", err)
 	} else {
 		logger.Printf("reauth: logout ok")
@@ -152,7 +168,7 @@ func (g *Guard) DoLogin(ctx context.Context, logger *log.Logger) error {
 	}
 	defer creds.Clear()
 
-	ip, err := detectClientIP(ctx, g.portal, g.cfg.ACID, creds.Username)
+	ip, err := g.portal.detectClientIP(ctx, g.cfg.ACID, creds.Username)
 	if err != nil {
 		return err
 	}
@@ -161,14 +177,14 @@ func (g *Guard) DoLogin(ctx context.Context, logger *log.Logger) error {
 	}
 
 	// Agree to portal protocol before login (required when UserAgreeSwitch is enabled)
-	if err := agreePortalProtocol(ctx, g.portal, creds.Username); err != nil {
+	if err := g.portal.agreePortalProtocol(ctx, creds.Username); err != nil {
 		logger.Printf("protocol agreement failed (non-fatal): %v", err)
 	} else {
 		logger.Printf("portal protocol agreed")
 	}
 
 	logger.Printf("offline; attempting SRUN login for ip=%s credentials=%s", ip, g.credentialSource)
-	resp, err := portalLogin(ctx, g.portal, creds.Username+g.cfg.Domain, creds.Password, ip, g.cfg.ACID)
+	resp, err := g.portal.portalLogin(ctx, creds.Username+g.cfg.Domain, creds.Password, ip, g.cfg.ACID)
 	if err != nil {
 		return err
 	}
@@ -204,9 +220,12 @@ func (g *Guard) handleProbeFail(ctx context.Context, logger *log.Logger, onlineI
 	return nil
 }
 
+// ErrWLANNotSupported is returned by reconnectWLAN on non-Windows platforms.
+var ErrWLANNotSupported = errors.New("wlan reconnect requires Windows; netsh is not available on this OS")
+
 func reconnectWLAN(ssid string, logger *log.Logger) error {
 	if runtime.GOOS != "windows" {
-		return nil
+		return ErrWLANNotSupported
 	}
 	logger.Printf("attempting WLAN reconnect: ssid=%s", ssid)
 	cmd := exec.Command("netsh", "wlan", "connect", "name="+ssid)
@@ -228,8 +247,17 @@ func isProfileNotFound(err error) bool {
 	if !errors.As(err, &exitErr) {
 		return false
 	}
-	// Match both Chinese and English netsh profile-not-found output
 	msg := err.Error()
-	return strings.Contains(msg, "未找到配置文件") ||
-		strings.Contains(msg, "is not found on any wireless interface")
+	// Exit code 1 combined with a profile-not-found message.
+	// netsh messages (any locale):
+	//   "There is no profile ... assigned to the specified interface."
+	//   "The profile ... is not found on any wireless interface."
+	if exitErr.ExitCode() == 1 {
+		if strings.Contains(msg, "assigned to the specified interface") ||
+			strings.Contains(msg, "is not found on any wireless") ||
+			strings.Contains(msg, "no profile") {
+			return true
+		}
+	}
+	return false
 }

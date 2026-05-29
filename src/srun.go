@@ -1,6 +1,7 @@
 package campus
 
 import (
+	"time"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -83,12 +84,31 @@ type agreeResponse struct {
 	Message string `json:"message"`
 }
 
+// portalClient wraps HTTP configuration shared across portal requests.
+type portalClient struct {
+	baseURL string
+	http    *http.Client
+}
+
+// newPortalClient creates a portal client with the default SRUN redirect policy.
+func newPortalClient(baseURL string, timeout time.Duration) *portalClient {
+	return &portalClient{
+		baseURL: baseURL,
+		http: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
 // ---- HTTP portal methods ----
 
-func campusOnline(ctx context.Context, c *httpClient) (bool, userInfoResponse, error) {
+func (c *portalClient) campusOnline(ctx context.Context) (bool, userInfoResponse, error) {
 	var info userInfoResponse
 	endpoint := mustJoinURL(c.baseURL, "/cgi-bin/rad_user_info")
-	body, err := getJSONP(ctx, c, endpoint, url.Values{"callback": {DefaultCallback}})
+	body, err := c.getJSONP(ctx, endpoint, url.Values{"callback": {DefaultCallback}})
 	if err != nil {
 		return false, info, err
 	}
@@ -98,7 +118,7 @@ func campusOnline(ctx context.Context, c *httpClient) (bool, userInfoResponse, e
 	return responseOK(info.Error, info.Res), info, nil
 }
 
-func internetReachable(ctx context.Context, c *httpClient, probeURL, probeContains string) bool {
+func (c *portalClient) internetReachable(ctx context.Context, probeURL, probeContains string) bool {
 	if probeURL == "" {
 		return true
 	}
@@ -121,7 +141,7 @@ func internetReachable(ctx context.Context, c *httpClient, probeURL, probeContai
 	return err == nil && strings.Contains(string(body), probeContains)
 }
 
-func detectClientIP(ctx context.Context, c *httpClient, acID, username string) (string, error) {
+func (c *portalClient) detectClientIP(ctx context.Context, acID, username string) (string, error) {
 	portalURL := mustJoinURL(c.baseURL, "/srun_portal_pc")
 	u, err := url.Parse(portalURL)
 	if err != nil {
@@ -154,14 +174,14 @@ func detectClientIP(ctx context.Context, c *httpClient, acID, username string) (
 		return string(matches[1]), nil
 	}
 
-	challenge, err := getChallenge(ctx, c, username, "", acID)
+	challenge, err := c.getChallenge(ctx, username, "", acID)
 	if err != nil {
 		return "", err
 	}
 	return challenge.ClientIP, nil
 }
 
-func getChallenge(ctx context.Context, c *httpClient, username, ip, acID string) (challengeResponse, error) {
+func (c *portalClient) getChallenge(ctx context.Context, username, ip, acID string) (challengeResponse, error) {
 	endpoint := mustJoinURL(c.baseURL, "/cgi-bin/get_challenge")
 	values := url.Values{
 		"callback": {DefaultCallback},
@@ -170,7 +190,7 @@ func getChallenge(ctx context.Context, c *httpClient, username, ip, acID string)
 	if ip != "" {
 		values.Set("ip", ip)
 	}
-	body, err := getJSONP(ctx, c, endpoint, values)
+	body, err := c.getJSONP(ctx, endpoint, values)
 	if err != nil {
 		return challengeResponse{}, err
 	}
@@ -186,7 +206,7 @@ func getChallenge(ctx context.Context, c *httpClient, username, ip, acID string)
 
 // agreePortalProtocol fetches the latest portal agreement and agrees to it
 // on behalf of the given user. This is required when UserAgreeSwitch is enabled.
-func agreePortalProtocol(ctx context.Context, c *httpClient, username string) error {
+func (c *portalClient) agreePortalProtocol(ctx context.Context, username string) error {
 	// 1. Fetch latest protocol
 	protoURL := mustJoinURL(c.baseURL, "/v1/srun_portal_agree_new")
 	u, err := url.Parse(protoURL)
@@ -253,8 +273,8 @@ func agreePortalProtocol(ctx context.Context, c *httpClient, username string) er
 	return nil
 }
 
-func portalLogin(ctx context.Context, c *httpClient, username, password, ip, acID string) (loginResponse, error) {
-	challenge, err := getChallenge(ctx, c, username, ip, acID)
+func (c *portalClient) portalLogin(ctx context.Context, username, password, ip, acID string) (loginResponse, error) {
+	challenge, err := c.getChallenge(ctx, username, ip, acID)
 	if err != nil {
 		return loginResponse{}, err
 	}
@@ -265,7 +285,7 @@ func portalLogin(ctx context.Context, c *httpClient, username, password, ip, acI
 	}
 	params.Set("callback", DefaultCallback)
 
-	body, err := getJSONP(ctx, c, mustJoinURL(c.baseURL, "/cgi-bin/srun_portal"), params)
+	body, err := c.getJSONP(ctx, mustJoinURL(c.baseURL, "/cgi-bin/srun_portal"), params)
 	if err != nil {
 		return loginResponse{}, err
 	}
@@ -276,7 +296,7 @@ func portalLogin(ctx context.Context, c *httpClient, username, password, ip, acI
 	return resp, nil
 }
 
-func portalLogout(ctx context.Context, c *httpClient, username, ip, acID string) error {
+func (c *portalClient) portalLogout(ctx context.Context, username, ip, acID string) error {
 	endpoint := mustJoinURL(c.baseURL, "/cgi-bin/srun_portal")
 	params := url.Values{
 		"callback": {DefaultCallback},
@@ -285,7 +305,7 @@ func portalLogout(ctx context.Context, c *httpClient, username, ip, acID string)
 		"username": {username},
 		"ip":       {ip},
 	}
-	body, err := getJSONP(ctx, c, endpoint, params)
+	body, err := c.getJSONP(ctx, endpoint, params)
 	if err != nil {
 		return err
 	}
@@ -299,7 +319,7 @@ func portalLogout(ctx context.Context, c *httpClient, username, ip, acID string)
 	return nil
 }
 
-func getJSONP(ctx context.Context, c *httpClient, endpoint string, values url.Values) ([]byte, error) {
+func (c *portalClient) getJSONP(ctx context.Context, endpoint string, values url.Values) ([]byte, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err

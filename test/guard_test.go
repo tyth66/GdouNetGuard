@@ -1,4 +1,4 @@
-package campus_test
+﻿package campus_test
 
 import (
 	"context"
@@ -44,7 +44,7 @@ func TestDetectClientIPFromPortalHTML(t *testing.T) {
 		BaseURL:   srv.URL,
 		ACID:      "153",
 		Timeout:   5 * time.Second,
-		Interval:  15 * time.Second,
+		Interval: campus.DefaultInterval,
 		ProbeURL:  "",
 	}, credLoader, "test", true)
 
@@ -82,7 +82,7 @@ func TestDetectClientIPFallbackToChallenge(t *testing.T) {
 		BaseURL:   srv.URL,
 		ACID:      "153",
 		Timeout:   5 * time.Second,
-		Interval:  15 * time.Second,
+		Interval: campus.DefaultInterval,
 		ProbeURL:  "",
 	}, credLoader, "test", true)
 

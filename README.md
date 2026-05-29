@@ -9,10 +9,13 @@ Go 版校园网自动认证守护脚本，针对海大校园网 SRUN / 深澜门
 - **WLAN 自动重连**：网络不可达时自动调用 `netsh wlan connect` 重连 WiFi（Windows）
 - **互联网连通性探测**：不仅检查 portal 在线状态，还探测外网是否可达，连续探测失败时强制重新认证
 - **凭据安全存储**：通过 Windows DPAPI 加密保存账号密码，不会以明文写入文件
+- **凭据自动保存**：首次前台运行时无凭据则交互式引导输入并自动加密保存；从环境变量读取的凭据也会自动持久化
+- **配置持久化**：有效配置自动写入 `config.json`，后续运行无需重复指定 CLI 参数
 - **多种运行模式**：一次性检查（`-once`）、持续守护、后台进程（`-background`）、开机自启（`-enable-startup`）
-- **日志轮转**：运行时每次写入前检查文件大小，超出阈值即时轮转，长期运行不会占满磁盘
+- **日志轮转**：运行时每次写入前检查文件大小，超出阈值即时轮转
+- **日志去重**：连续多条 `online;` 状态行自动折叠为首尾两条，避免日志膨胀
+- **日志老化清理**：超出保留期限的轮转日志自动删除
 - **PID 互斥锁**：通过 PID 文件防止重复实例运行
-- **交互式凭据录入**：首次运行时无凭据则自动引导输入，输入后立即加密保存
 
 > **非 Windows 平台**：守护循环（`-once` / 持续运行）仍可用，但后台进程（`-background`）、
 > 开机自启（`-enable-startup`）和 WLAN 自动重连仅支持 Windows。在这些平台上使用对应
@@ -37,6 +40,9 @@ Go 版校园网自动认证守护脚本，针对海大校园网 SRUN / 深澜门
 
 如果 `CAMPUS_USERNAME` 和 `CAMPUS_PASSWORD` 环境变量已设置，会直接读取变量值保存；
 如果未设置，同样会进入交互式输入。
+
+所有非默认的配置参数会自动保存到 `%LocalAppData%\GdouNetGuard\config.json`，
+后续在后台或开机自启模式下会自动加载。
 
 ## 凭据管理
 
@@ -111,7 +117,7 @@ $env:CAMPUS_PASSWORD = "你的校园网密码"
 
 ```powershell
 .\GdouNetGuard.exe
-.\GdouNetGuard.exe -interval 30s
+.\GdouNetGuard.exe -interval 60s
 ```
 
 按 `Ctrl+C` 退出，退出时自动清理 PID 文件。
@@ -121,10 +127,10 @@ $env:CAMPUS_PASSWORD = "你的校园网密码"
 启动隐藏的后台进程，命令立即返回：
 
 ```powershell
-.\GdouNetGuard.exe -background -log-file logs\guard.log
+.\GdouNetGuard.exe -background
 ```
 
-仅在 Windows 上可用。后台进程不会输出到控制台，必须配合 `-log-file` 使用才能查看日志。
+仅在 Windows 上可用。后台进程日志默认写入 `%AppData%\GdouNetGuard\guard.log`。
 
 ### 开机自启（`-enable-startup`）
 
@@ -163,8 +169,9 @@ $env:CAMPUS_PASSWORD = "你的校园网密码"
 | `-base-url` | `http://10.129.1.1` | 门户基础地址 |
 | `-ac-id` | `153` | SRUN `ac_id` |
 | `-ssid` | `海大校园网` | WLAN 配置名称（`netsh wlan connect` 使用的 profile 名） |
-| `-interval` | `15s` | 守护模式检查间隔 |
-| `-timeout` | `8s` | HTTP 超时 |
+| `-interval` | `30s` | 守护模式检查间隔 |
+| `-timeout` | `8s` | 登录操作 HTTP 超时 |
+| `-probe-timeout` | `30s` | 状态探测 HTTP 超时（独立于登录超时） |
 | `-probe-url` | `http://www.msftconnecttest.com/connecttest.txt` | 外网连通性探测地址 |
 | `-probe-contains` | `Microsoft Connect Test` | 探测响应中应包含的文本；设为空则只检查 HTTP 状态码 |
 | `-domain` | — | 可选账号域名后缀，如 `@cmcc` |
@@ -173,6 +180,7 @@ $env:CAMPUS_PASSWORD = "你的校园网密码"
 | `-save-credentials` | — | 保存凭据到 DPAPI 加密存储后退出（无环境变量时交互输入） |
 | `-forget-credentials` | — | 删除已保存的账号密码后退出 |
 | `-credential-file` | `%AppData%\GdouNetGuard\credentials.json` | 加密凭据文件路径 |
+| `-config` | `%LocalAppData%\GdouNetGuard\config.json` | JSON 配置文件路径 |
 | `-background` | — | 在隐藏后台进程中启动持续守护后退出（仅 Windows） |
 | `-enable-startup` | — | 创建或更新当前用户的 Windows 开机自启计划任务后退出 |
 | `-disable-startup` | — | 删除当前用户的 Windows 开机自启计划任务后退出 |
@@ -181,11 +189,41 @@ $env:CAMPUS_PASSWORD = "你的校园网密码"
 | `-dry-run` | — | 只构造参数，不提交登录 |
 | `-once` | — | 只运行一轮后退出 |
 | `-version` | — | 输出版本号后退出 |
-| `-log-file` | — | 日志文件路径；不设置则输出到 stdout |
+| `-log-file` | `%AppData%\GdouNetGuard\guard.log` | 日志文件路径 |
 | `-log-max-size` | `1048576` (1 MB) | 日志超过此字节数时轮转 |
 | `-log-max-backups` | `3` | 保留的轮转日志份数 |
+| `-log-max-age` | `168h` (7 天) | 超过此时间的轮转日志自动删除 |
 | `-pid-file` | `%TEMP%\GdouNetGuard.pid` | PID 文件路径（互斥锁） |
 | `-max-probe-fails` | `3` | 互联网探测连续失败 N 次后强制重登；设为 0 禁用 |
+
+## 配置持久化
+
+程序启动时会自动合并三层配置，优先级从高到低：
+
+1. CLI 参数（最高优先）
+2. `config.json` 文件（被 CLI 覆盖）
+3. 硬编码默认值
+
+非默认配置在 `-save-credentials`、`-enable-startup`、`-background` 和前台守护启动时
+自动写入 `config.json`。后台/开机自启模式启动时自动加载该文件，无需重新传递 CLI 参数。
+
+配置文件路径可通过 `-config` 自定义：
+
+```powershell
+.\GdouNetGuard.exe -config "D:\my-config.json"
+```
+
+### 配置文件示例
+
+```json
+{
+  "interval": "1m0s",
+  "probe_timeout": "15s",
+  "log_max_age": "336h"
+}
+```
+
+只存储与默认值不同的字段。
 
 ## 工作原理
 
@@ -225,12 +263,14 @@ WLAN profile 丢失时日志会明确提示，在 Windows 中重新连接该 WiF
 - `DoLogin` 返回前立即通过 `defer creds.Clear()` 清除内存中的明文密码
 - `credentials.json` 中用户名和密码均经 DPAPI 加密，仅当前 Windows 用户可解密
 
-### 日志轮转
+### 日志轮转与去重
 
 - 启动时检查日志文件大小，超出阈值则轮转
 - 运行时每次写入前检查，超阈值即时轮转
 - 保留最近 `-log-max-backups` 份历史日志（`guard.log.1`、`guard.log.2`...）
-- 长期运行不会因日志文件增长占满磁盘
+- 超过 `-log-max-age` 的轮转日志自动删除
+- 连续 `online;` 状态行自动去重：当写入第三条连续在线记录时，删除中间行仅保留首尾两条
+- 非 online 行（错误、登录等）不受去重影响，全部保留
 
 ### 优雅退出
 
