@@ -14,3 +14,9 @@ Thumbs.db
 
 # Build artifacts
 *.out
+
+# OMX runtime
+.omx/
+
+# Runtime logs
+logs/

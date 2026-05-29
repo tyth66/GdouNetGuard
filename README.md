@@ -12,6 +12,7 @@ Go 版校园网自动认证守护脚本，针对海大校园网 SRUN / 深澜门
 - **多种运行模式**：一次性检查（`-once`）、持续守护、后台进程（`-background`）、开机自启（`-enable-startup`）
 - **日志轮转**：运行时每次写入前检查文件大小，超出阈值即时轮转，长期运行不会占满磁盘
 - **PID 互斥锁**：通过 PID 文件防止重复实例运行
+- **交互式凭据录入**：首次运行时无凭据则自动引导输入，输入后立即加密保存
 
 > **非 Windows 平台**：守护循环（`-once` / 持续运行）仍可用，但后台进程（`-background`）、
 > 开机自启（`-enable-startup`）和 WLAN 自动重连仅支持 Windows。在这些平台上使用对应
@@ -19,31 +20,23 @@ Go 版校园网自动认证守护脚本，针对海大校园网 SRUN / 深澜门
 
 ## 快速开始
 
-### 1. 设置账号密码环境变量
-
-```powershell
-setx CAMPUS_USERNAME "你的校园网账号"
-setx CAMPUS_PASSWORD "你的校园网密码"
-```
-
-重新打开 PowerShell 后生效。
-
-### 2. 一次性检查并登录
-
-```powershell
-.\GdouNetGuard.exe -once
-```
-
-> 首次运行时，如果设置了环境变量，凭据会自动保存到 DPAPI 加密存储。
-> 后续即使清除环境变量，也能自动读取已保存的凭据。
-
-### 3. 持续守护（推荐）
+首次运行时直接启动守护即可，程序会自动引导设置凭据：
 
 ```powershell
 .\GdouNetGuard.exe
 ```
 
-每隔 15 秒检查校园网状态，离线时自动登录。按 `Ctrl+C` 优雅退出。
+启动后若未检测到任何凭据，会提示输入账号密码，输入后自动通过 Windows DPAPI 加密保存，
+后续运行无需再次输入。
+
+也可以先单独保存凭据（不启动守护）：
+
+```powershell
+.\GdouNetGuard.exe -save-credentials
+```
+
+如果 `CAMPUS_USERNAME` 和 `CAMPUS_PASSWORD` 环境变量已设置，会直接读取变量值保存；
+如果未设置，同样会进入交互式输入。
 
 ## 凭据管理
 
@@ -52,34 +45,37 @@ setx CAMPUS_PASSWORD "你的校园网密码"
 | 来源 | 说明 |
 |---|---|
 | 环境变量 | `CAMPUS_USERNAME` + `CAMPUS_PASSWORD`，适合临时使用 |
-| DPAPI 加密存储 | 通过 `-save-credentials` 保存，适合长期使用 |
+| 交互式输入 | 首次运行守护或 `-save-credentials` 时自动触发 |
+| DPAPI 加密存储 | 加密文件 `%AppData%\GdouNetGuard\credentials.json`，适合长期使用 |
 
-### 保存凭据（推荐）
+### 凭据自动保存
 
-先用环境变量设置账号密码，再加密保存：
+守护模式（前台运行）首次启动时，如果没有可用的凭据：
+
+1. 日志输出 `*** No credentials found ... ***` 警告
+2. 交互式提示输入账号和密码
+3. 自动通过 Windows DPAPI 加密保存
+4. 保存后即继续守护循环
+
+如果已有环境变量，运行时会自动将其加密保存到 DPAPI 存储，
+后续移除环境变量后仍可从加密文件读取。
+
+### 手动保存凭据
 
 ```powershell
+# 方式一：先设环境变量再保存
 $env:CAMPUS_USERNAME = "你的校园网账号"
 $env:CAMPUS_PASSWORD = "你的校园网密码"
 .\GdouNetGuard.exe -save-credentials
+
+# 方式二：直接运行 -save-credentials 进入交互式输入
+.\GdouNetGuard.exe -save-credentials
 ```
 
-保存成功后即可清除环境变量中的密码：
-
-> **凭据会自动保存**：只要运行时检测到环境变量中有账号密码，就会自动保存到 DPAPI 加密存储。
-> 正常使用（`-once` 或持续守护模式）即可触发自动保存，无需手动执行 `-save-credentials`。
-> 手动 `-save-credentials` 仅在只想保存凭据而不执行认证时使用。
-
-```powershell
-Remove-Item Env:\CAMPUS_USERNAME
-Remove-Item Env:\CAMPUS_PASSWORD
-```
-
-凭据保存位置：`%AppData%\GdouNetGuard\credentials.json`，使用当前用户 DPAPI 加密，同台机器上其他 Windows 用户无法直接解密。
+凭据保存位置：`%AppData%\GdouNetGuard\credentials.json`，使用当前用户 DPAPI 加密，
+同台机器上其他 Windows 用户无法直接解密。
 
 ### 验证
-
-保存凭据后直接运行一次性检查确认凭据可用：
 
 ```powershell
 .\GdouNetGuard.exe -once
@@ -144,9 +140,6 @@ Remove-Item Env:\CAMPUS_PASSWORD
 .\GdouNetGuard.exe -disable-startup
 ```
 
-> 开机自启不会把账号密码写入计划任务。首次运行守护模式时凭据会自动保存，
-> 确认凭据已保存后再启用自启。自启任务使用后台模式运行，默认任务名称为 `GdouNetGuard`。
-
 ### 强制重新认证（`-reauth`）
 
 先注销再登录，一次性操作后退出：
@@ -155,11 +148,9 @@ Remove-Item Env:\CAMPUS_PASSWORD
 .\GdouNetGuard.exe -reauth
 ```
 
-自动完成协议同意流程，无需手动勾选网页复选框。
-
 ### 试运行（`-dry-run`）
 
-构造登录参数但不提交，用于调试：
+构建登录参数但不提交，用于调试：
 
 ```powershell
 .\GdouNetGuard.exe -once -dry-run
@@ -179,7 +170,7 @@ Remove-Item Env:\CAMPUS_PASSWORD
 | `-domain` | — | 可选账号域名后缀，如 `@cmcc` |
 | `-username-env` | `CAMPUS_USERNAME` | 账号环境变量名 |
 | `-password-env` | `CAMPUS_PASSWORD` | 密码环境变量名 |
-| `-save-credentials` | — | 从环境变量读取账号密码，用 Windows DPAPI 加密保存后退出 |
+| `-save-credentials` | — | 保存凭据到 DPAPI 加密存储后退出（无环境变量时交互输入） |
 | `-forget-credentials` | — | 删除已保存的账号密码后退出 |
 | `-credential-file` | `%AppData%\GdouNetGuard\credentials.json` | 加密凭据文件路径 |
 | `-background` | — | 在隐藏后台进程中启动持续守护后退出（仅 Windows） |
@@ -211,8 +202,6 @@ Remove-Item Env:\CAMPUS_PASSWORD
 └── 离线 + 无凭据 → 报告错误（WLAN 重连仍会执行）
 ```
 
-互联网探测用于识别"portal 显示在线但实际无法上网"的假在线状态，常见于认证会话过期但 portal 尚未刷新状态时。连续失败达到 `-max-probe-fails` 次后强制重新认证。
-
 ### 登录流程
 
 1. 自动同意门户协议条款（`/v1/srun_portal_agree_new` → `/v1/srun_portal_agree_bind`）
@@ -224,9 +213,11 @@ Remove-Item Env:\CAMPUS_PASSWORD
 
 ### WLAN 恢复
 
-当校园网不可达时，守护进程先尝试 WLAN 重连再尝试认证。WLAN profile 丢失时日志会明确提示 `*** WLAN profile ... not found ***`，在 Windows 中重新连接该 WiFi 并勾选自动连接即可恢复。`netsh` 的具体错误信息会完整记录在日志中。
+当校园网不可达时，守护进程先尝试 WLAN 重连再尝试认证。
+WLAN profile 丢失时日志会明确提示，在 Windows 中重新连接该 WiFi 并勾选自动连接即可恢复。
 
-> **注意**：WLAN 重连只能恢复网络连接，不能替代身份认证。首次运行时设置环境变量即可自动保存凭据，后续无需再设环境变量，网络 + 认证均可全自动恢复。
+> WLAN 重连只能恢复网络连接，不能代替身份认证。
+> 首次运行时设置凭据即可自动保存，后续无需再设置环境变量，网络 + 认证均可全自动恢复。
 
 ### 凭据安全
 
@@ -254,6 +245,6 @@ go build -o GdouNetGuard.exe .
 
 ## 说明
 
-该门户使用 SRUN challenge 登录流程，且启用了用户协议条款开关（`UserAgreeSwitch`）。本工具在登录前自动调用协议同意 API，无需手动勾选网页复选框。
-
+该门户使用 SRUN challenge 登录流程，且启用了用户协议条款开关（`UserAgreeSwitch`）。
+本工具在登录前自动调用协议同意 API，无需手动勾选网页复选框。
 如果学校后续改成验证码、短信、扫码或动态二次验证，纯命令行自动登录会失效，需要改成半自动或浏览器自动化方案。

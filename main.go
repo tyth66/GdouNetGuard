@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,7 +57,14 @@ func main() {
 	}
 	if cfg.SaveCredentials {
 		if err := campus.SaveCredentialsFromEnv(cfg, store); err != nil {
-			logger.Fatal(err)
+			logger.Printf("environment variables not set, prompting interactively")
+			creds, promptErr := interactivePromptCredentials(cfg.UsernameEnv, cfg.PasswordEnv)
+			if promptErr != nil {
+				logger.Fatal(promptErr)
+			}
+			if err := store.Save(creds); err != nil {
+				logger.Fatal(err)
+			}
 		}
 		logger.Printf("credentials saved with Windows DPAPI: %s", store.Path())
 		return
@@ -91,6 +101,24 @@ func main() {
 	}()
 
 	creds, credSource, hasCreds := resolveCredentials(cfg, store, logger)
+
+	// First startup: if no credentials exist and we are running as a foreground
+	// daemon (not -once/ -reauth/ -background), prompt interactively and auto-save.
+	if !hasCreds && !cfg.Once && !cfg.Reauth && !cfg.Background {
+		logger.Printf("*** No credentials found. Set %s and %s, or enter them now. ***", cfg.UsernameEnv, cfg.PasswordEnv)
+		promptedCreds, err := interactivePromptCredentials(cfg.UsernameEnv, cfg.PasswordEnv)
+		if err != nil {
+			logger.Printf("interactive prompt failed: %v", err)
+		} else {
+			if err := store.Save(promptedCreds); err != nil {
+				logger.Fatalf("auto-save after prompt failed: %v", err)
+			}
+			logger.Printf("credentials auto-saved to %s", store.Path())
+			creds = &promptedCreds
+			credSource = "interactive prompt"
+			hasCreds = true
+		}
+	}
 
 	// Auto-save credentials from environment to DPAPI store, so future runs
 	// can authenticate without environment variables being set.
@@ -199,4 +227,33 @@ func resolveCredentials(cfg campus.Config, store campus.CredentialStore, logger 
 	}
 	logger.Printf("credentials loaded from %s", source)
 	return &creds, source, true
+}
+
+// interactivePromptCredentials reads username and password from stdin.
+// The env names are shown in the prompts so the user knows which variables
+// would be used instead of interactive input.
+func interactivePromptCredentials(usernameEnv, passwordEnv string) (campus.Credentials, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Printf("Campus username (%s): ", usernameEnv)
+	username, err := reader.ReadString('\n')
+	if err != nil {
+		return campus.Credentials{}, fmt.Errorf("read username: %w", err)
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return campus.Credentials{}, errors.New("username is required")
+	}
+
+	fmt.Printf("Campus password (%s): ", passwordEnv)
+	password, err := reader.ReadString('\n')
+	if err != nil {
+		return campus.Credentials{}, fmt.Errorf("read password: %w", err)
+	}
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return campus.Credentials{}, errors.New("password is required")
+	}
+
+	return campus.Credentials{Username: username, Password: password}, nil
 }
