@@ -25,6 +25,8 @@ const (
 	DefaultInterval        = 30 * time.Second
 	DefaultProbeTimeout    = 30 * time.Second
 	DefaultLogMaxAge       = 7 * 24 * time.Hour
+	DefaultRetryMax       = 2
+	DefaultRetryBaseDelay = 500 * time.Millisecond
 	DefaultSSID            = "海大校园网"
 	DefaultUsernameEnv     = "CAMPUS_USERNAME"
 	DefaultPasswordEnv     = "CAMPUS_PASSWORD"
@@ -37,7 +39,7 @@ type Config struct {
 	ACID              string
 	Domain            string
 	SSID              string
-	ProbeURL          string
+	ProbeURLs         []string
 	ProbeContains     string
 	UsernameEnv       string
 	PasswordEnv       string
@@ -60,6 +62,8 @@ type Config struct {
 	LogMaxBackups     int
 	PidFile           string
 	MaxProbeFails     int
+	RetryMax         int
+	RetryBaseDelay   time.Duration
 	LogMaxAge         time.Duration
 }
 
@@ -69,7 +73,7 @@ type configFilePayload struct {
 	ACID           string `json:"ac_id,omitempty"`
 	Domain         string `json:"domain,omitempty"`
 	SSID           string `json:"ssid,omitempty"`
-	ProbeURL       string `json:"probe_url,omitempty"`
+	ProbeURLs      string `json:"probe_urls,omitempty"`
 	ProbeContains  string `json:"probe_contains,omitempty"`
 	UsernameEnv    string `json:"username_env,omitempty"`
 	PasswordEnv    string `json:"password_env,omitempty"`
@@ -82,6 +86,8 @@ type configFilePayload struct {
 	LogMaxSize     int64  `json:"log_max_size,omitempty"`
 	LogMaxBackups  int    `json:"log_max_backups,omitempty"`
 	MaxProbeFails  int    `json:"max_probe_fails,omitempty"`
+	RetryMax       int    `json:"retry_max,omitempty"`
+	RetryBaseDelay string `json:"retry_base_delay,omitempty"`
 	LogMaxAge      string `json:"log_max_age,omitempty"`
 }
 
@@ -120,7 +126,9 @@ func LoadConfigFile(path string) (Config, error) {
 	cfg.ACID = p.ACID
 	cfg.Domain = p.Domain
 	cfg.SSID = p.SSID
-	cfg.ProbeURL = p.ProbeURL
+	if p.ProbeURLs != "" {
+		cfg.ProbeURLs = strings.Split(p.ProbeURLs, ",")
+	}
 	cfg.ProbeContains = p.ProbeContains
 	cfg.UsernameEnv = p.UsernameEnv
 	cfg.PasswordEnv = p.PasswordEnv
@@ -162,8 +170,8 @@ func SaveConfigFile(cfg Config, path string) error {
 	if cfg.SSID != def.SSID {
 		p.SSID = cfg.SSID
 	}
-	if cfg.ProbeURL != def.ProbeURL {
-		p.ProbeURL = cfg.ProbeURL
+	if !stringSlicesEqual(cfg.ProbeURLs, def.ProbeURLs) {
+		p.ProbeURLs = strings.Join(cfg.ProbeURLs, ",")
 	}
 	if cfg.ProbeContains != def.ProbeContains {
 		p.ProbeContains = cfg.ProbeContains
@@ -191,6 +199,12 @@ func SaveConfigFile(cfg Config, path string) error {
 	}
 	if cfg.MaxProbeFails != def.MaxProbeFails {
 		p.MaxProbeFails = cfg.MaxProbeFails
+	}
+	if cfg.RetryMax != def.RetryMax {
+		p.RetryMax = cfg.RetryMax
+	}
+	if cfg.RetryBaseDelay != def.RetryBaseDelay {
+		p.RetryBaseDelay = cfg.RetryBaseDelay.String()
 	}
 	if cfg.LogMaxAge != def.LogMaxAge {
 		p.LogMaxAge = cfg.LogMaxAge.String()
@@ -225,7 +239,7 @@ func defaultConfig() Config {
 		ACID:           DefaultACID,
 		Domain:         "",
 		SSID:           DefaultSSID,
-		ProbeURL:       DefaultProbeURL,
+		ProbeURLs:      []string{DefaultProbeURL},
 		ProbeContains:  DefaultProbeContains,
 		UsernameEnv:    DefaultUsernameEnv,
 		PasswordEnv:    DefaultPasswordEnv,
@@ -238,6 +252,8 @@ func defaultConfig() Config {
 		LogMaxSize:     DefaultLogMaxSize,
 		LogMaxBackups:  DefaultLogMaxBackups,
 		MaxProbeFails:  DefaultMaxProbeFails,
+		RetryMax:       DefaultRetryMax,
+		RetryBaseDelay: DefaultRetryBaseDelay,
 		LogMaxAge:      DefaultLogMaxAge,
 	}
 }
@@ -261,8 +277,8 @@ func mergeConfig(file, cli Config) Config {
 	if cli.SSID == def.SSID && file.SSID != "" {
 		out.SSID = file.SSID
 	}
-	if cli.ProbeURL == def.ProbeURL && file.ProbeURL != "" {
-		out.ProbeURL = file.ProbeURL
+	if stringSlicesEqual(cli.ProbeURLs, def.ProbeURLs) && len(file.ProbeURLs) > 0 {
+		out.ProbeURLs = file.ProbeURLs
 	}
 	if cli.ProbeContains == def.ProbeContains && file.ProbeContains != "" {
 		out.ProbeContains = file.ProbeContains
@@ -291,6 +307,12 @@ func mergeConfig(file, cli Config) Config {
 	if cli.MaxProbeFails == def.MaxProbeFails && file.MaxProbeFails != 0 {
 		out.MaxProbeFails = file.MaxProbeFails
 	}
+	if cli.RetryMax == def.RetryMax && file.RetryMax != 0 {
+		out.RetryMax = file.RetryMax
+	}
+	if cli.RetryBaseDelay == def.RetryBaseDelay && file.RetryBaseDelay != 0 {
+		out.RetryBaseDelay = file.RetryBaseDelay
+	}
 	if cli.LogMaxAge == def.LogMaxAge && file.LogMaxAge != 0 {
 		out.LogMaxAge = file.LogMaxAge
 	}
@@ -316,7 +338,10 @@ func ParseFlags() Config {
 	flag.StringVar(&cfg.ACID, "ac-id", DefaultACID, "SRUN ac_id")
 	flag.StringVar(&cfg.Domain, "domain", "", "optional account domain suffix, such as @cmcc")
 	flag.StringVar(&cfg.SSID, "ssid", DefaultSSID, "WLAN profile name for netsh wlan connect")
-	flag.StringVar(&cfg.ProbeURL, "probe-url", DefaultProbeURL, "internet connectivity probe URL")
+	probeURLFlag := ""
+	flag.StringVar(&probeURLFlag, "probe-url", DefaultProbeURL, "internet connectivity probe URL; use -probe-urls for multiple")
+	var probeURLsCSV string
+	flag.StringVar(&probeURLsCSV, "probe-urls", "", "comma-separated internet connectivity probe URLs (overrides -probe-url)")
 	flag.StringVar(&cfg.ProbeContains, "probe-contains", DefaultProbeContains, "text expected in probe response; empty disables body check")
 	flag.StringVar(&cfg.UsernameEnv, "username-env", DefaultUsernameEnv, "environment variable containing campus username")
 	flag.StringVar(&cfg.PasswordEnv, "password-env", DefaultPasswordEnv, "environment variable containing campus password")
@@ -340,12 +365,25 @@ func ParseFlags() Config {
 	flag.DurationVar(&cfg.LogMaxAge, "log-max-age", DefaultLogMaxAge, "delete rotated log backups older than this duration")
 	flag.StringVar(&cfg.PidFile, "pid-file", "", "PID file for mutual exclusion; defaults to os.TempDir")
 	flag.IntVar(&cfg.MaxProbeFails, "max-probe-fails", DefaultMaxProbeFails, "consecutive internet probe failures before forcing re-auth; 0 disables")
+	flag.IntVar(&cfg.RetryMax, "retry-max", DefaultRetryMax, "max HTTP retries per request; 0 disables")
+	flag.DurationVar(&cfg.RetryBaseDelay, "retry-base-delay", DefaultRetryBaseDelay, "initial delay for exponential backoff")
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
 	if showVersion {
 		fmt.Println(Version)
 		os.Exit(0)
+	}
+
+	// Build probe URL list
+	if probeURLsCSV != "" {
+		for _, u := range strings.Split(probeURLsCSV, ",") {
+			if trimmed := strings.TrimSpace(u); trimmed != "" {
+				cfg.ProbeURLs = append(cfg.ProbeURLs, trimmed)
+			}
+		}
+	} else {
+		cfg.ProbeURLs = []string{probeURLFlag}
 	}
 
 	// Resolve config file path
@@ -424,13 +462,34 @@ func (c Config) Validate() error {
 	if c.MaxProbeFails < 0 {
 		return errors.New("-max-probe-fails cannot be negative")
 	}
+	if c.RetryMax < 0 {
+		return errors.New("-retry-max cannot be negative")
+	}
+	if c.RetryBaseDelay < 0 {
+		return errors.New("-retry-base-delay cannot be negative")
+	}
 	if _, err := url.ParseRequestURI(c.BaseURL); err != nil {
 		return fmt.Errorf("invalid -base-url: %w", err)
 	}
-	if c.ProbeURL != "" {
-		if _, err := url.ParseRequestURI(c.ProbeURL); err != nil {
-			return fmt.Errorf("invalid -probe-url: %w", err)
+	for _, u := range c.ProbeURLs {
+		if u != "" {
+			if _, err := url.ParseRequestURI(u); err != nil {
+				return fmt.Errorf("invalid probe URL %q: %w", u, err)
+			}
 		}
 	}
 	return nil
+}
+
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

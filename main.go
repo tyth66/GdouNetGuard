@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bufio"
@@ -277,3 +277,4 @@ func interactivePromptCredentials(usernameEnv, passwordEnv string) (campus.Crede
 
 	return campus.Credentials{Username: username, Password: password}, nil
 }
+

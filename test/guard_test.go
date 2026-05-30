@@ -45,7 +45,7 @@ func TestDetectClientIPFromPortalHTML(t *testing.T) {
 		ACID:      "153",
 		Timeout:   5 * time.Second,
 		Interval: campus.DefaultInterval,
-		ProbeURL:  "",
+		ProbeURLs: []string{"http://www.msftconnecttest.com/connecttest.txt"},
 	}, credLoader, "test", true)
 
 	logger := log.New(os.Stdout, "", 0)
@@ -83,7 +83,7 @@ func TestDetectClientIPFallbackToChallenge(t *testing.T) {
 		ACID:      "153",
 		Timeout:   5 * time.Second,
 		Interval: campus.DefaultInterval,
-		ProbeURL:  "",
+		ProbeURLs: []string{"http://www.msftconnecttest.com/connecttest.txt"},
 	}, credLoader, "test", true)
 
 	logger := log.New(os.Stdout, "", 0)
@@ -95,3 +95,4 @@ func TestDetectClientIPFallbackToChallenge(t *testing.T) {
 		t.Fatalf("unexpected error after fallback IP detection: %v", err)
 	}
 }
+

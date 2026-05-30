@@ -1,4 +1,4 @@
-package campus_test
+﻿package campus_test
 
 import (
 	"encoding/json"
@@ -69,7 +69,7 @@ func TestSaveConfigFileOmitsDefaults(t *testing.T) {
 		BaseURL:        campus.DefaultBaseURL,
 		ACID:           "200",
 		SSID:           campus.DefaultSSID,
-		ProbeURL:       campus.DefaultProbeURL,
+		ProbeURLs: []string{campus.DefaultProbeURL},
 		ProbeContains:  campus.DefaultProbeContains,
 		UsernameEnv:    campus.DefaultUsernameEnv,
 		PasswordEnv:    campus.DefaultPasswordEnv,
@@ -165,3 +165,5 @@ func TestDefaultLogFilePath(t *testing.T) {
 		t.Fatalf("unexpected filename: %s", filepath.Base(path))
 	}
 }
+
+

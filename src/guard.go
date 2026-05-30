@@ -1,4 +1,4 @@
-package campus
+﻿package campus
 
 import (
 	"context"
@@ -23,6 +23,7 @@ type Guard struct {
 	hasCreds         bool
 	probeFailCount   int
 	portal           *portalClient
+	agreementStatus  string // "unknown", "agreed", "disabled", "error"
 }
 
 // NewGuard creates a new Guard instance.
@@ -32,7 +33,7 @@ func NewGuard(cfg Config, credLoader CredentialLoader, credSource string, hasCre
 		credLoader:       credLoader,
 		credentialSource: credSource,
 		hasCreds:         hasCreds,
-		portal:           newPortalClient(cfg.BaseURL, cfg.Timeout),
+		portal:           newPortalClient(cfg.BaseURL, cfg.Timeout, cfg.RetryMax, cfg.RetryBaseDelay),
 	}
 }
 
@@ -104,7 +105,7 @@ func (g *Guard) handleUnreachable(ctx context.Context, logger *log.Logger, probe
 // repeated failures.
 func (g *Guard) handleOnline(ctx context.Context, logger *log.Logger, onlineInfo userInfoResponse) error {
 	pctx, cancel := g.probeContext(ctx)
-	reachable := g.portal.internetReachable(pctx, g.cfg.ProbeURL, g.cfg.ProbeContains)
+	reachable := g.portal.internetReachable(pctx, g.cfg.ProbeURLs, g.cfg.ProbeContains)
 	cancel()
 	if reachable {
 		g.probeFailCount = 0
@@ -260,4 +261,17 @@ func isProfileNotFound(err error) bool {
 		}
 	}
 	return false
+}
+
+
+// classifyAgreementError categorizes agreement errors for observability.
+func classifyAgreementError(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "HTTP 404") || strings.Contains(msg, "returned HTTP 404") {
+		return "disabled"
+	}
+	if strings.Contains(msg, "protocol unavailable") {
+		return "unavailable"
+	}
+	return "error"
 }

@@ -1,7 +1,6 @@
-package campus
+﻿package campus
 
 import (
-	"time"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -15,11 +14,12 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const srunBase64Alphabet = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 
-const portalAgreeType = "1" // 1 = normal user (portal protocol agreement)
+const portalAgreeType = "1"
 
 // ---- response types ----
 
@@ -67,9 +67,9 @@ type encodedUserInfo struct {
 }
 
 type protocolResponse struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    *protocolData    `json:"data"`
+	Code    int           `json:"code"`
+	Message string        `json:"message"`
+	Data    *protocolData `json:"data"`
 }
 
 type protocolData struct {
@@ -86,14 +86,17 @@ type agreeResponse struct {
 
 // portalClient wraps HTTP configuration shared across portal requests.
 type portalClient struct {
-	baseURL string
-	http    *http.Client
+	baseURL        string
+	http           *http.Client
+	retryMax       int
+	retryBaseDelay time.Duration
 }
 
-// newPortalClient creates a portal client with the default SRUN redirect policy.
-func newPortalClient(baseURL string, timeout time.Duration) *portalClient {
+func newPortalClient(baseURL string, timeout time.Duration, retryMax int, retryBaseDelay time.Duration) *portalClient {
 	return &portalClient{
-		baseURL: baseURL,
+		baseURL:        baseURL,
+		retryMax:       retryMax,
+		retryBaseDelay: retryBaseDelay,
 		http: &http.Client{
 			Timeout: timeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -118,15 +121,27 @@ func (c *portalClient) campusOnline(ctx context.Context) (bool, userInfoResponse
 	return responseOK(info.Error, info.Res), info, nil
 }
 
-func (c *portalClient) internetReachable(ctx context.Context, probeURL, probeContains string) bool {
-	if probeURL == "" {
+// internetReachable probes each URL in order. The first successful probe
+// returns true; if all fail, returns false.
+func (c *portalClient) internetReachable(ctx context.Context, probeURLs []string, probeContains string) bool {
+	if len(probeURLs) == 0 {
 		return true
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-	if err != nil {
-		return false
+	for _, probeURL := range probeURLs {
+		if probeURL == "" {
+			continue
+		}
+		if c.tryProbe(ctx, probeURL, probeContains) {
+			return true
+		}
 	}
-	resp, err := c.http.Do(req)
+	return false
+}
+
+func (c *portalClient) tryProbe(ctx context.Context, probeURL, probeContains string) bool {
+	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	})
 	if err != nil {
 		return false
 	}
@@ -152,11 +167,9 @@ func (c *portalClient) detectClientIP(ctx context.Context, acID, username string
 	q.Set("theme", "pro")
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -204,10 +217,7 @@ func (c *portalClient) getChallenge(ctx context.Context, username, ip, acID stri
 	return challenge, nil
 }
 
-// agreePortalProtocol fetches the latest portal agreement and agrees to it
-// on behalf of the given user. This is required when UserAgreeSwitch is enabled.
 func (c *portalClient) agreePortalProtocol(ctx context.Context, username string) error {
-	// 1. Fetch latest protocol
 	protoURL := mustJoinURL(c.baseURL, "/v1/srun_portal_agree_new")
 	u, err := url.Parse(protoURL)
 	if err != nil {
@@ -217,12 +227,14 @@ func (c *portalClient) agreePortalProtocol(ctx context.Context, username string)
 	q.Set("agree_type", portalAgreeType)
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return fmt.Errorf("protocol request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
+		return req, nil
+	})
 	if err != nil {
 		return fmt.Errorf("protocol fetch: %w", err)
 	}
@@ -242,16 +254,17 @@ func (c *portalClient) agreePortalProtocol(ctx context.Context, username string)
 		return fmt.Errorf("protocol unavailable: code=%d message=%s", proto.Code, proto.Message)
 	}
 
-	// 2. Agree to protocol
 	agreeURL := mustJoinURL(c.baseURL, "/v1/srun_portal_agree_bind")
 	agreeBody := fmt.Sprintf("agree_id=%d&user_name=%s", proto.Data.ID, url.QueryEscape(username))
-	agreeReq, err := http.NewRequestWithContext(ctx, http.MethodPost, agreeURL, strings.NewReader(agreeBody))
-	if err != nil {
-		return fmt.Errorf("agree request: %w", err)
-	}
-	agreeReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	agreeReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
-	agreeResp, err := c.http.Do(agreeReq)
+	agreeResp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, agreeURL, strings.NewReader(agreeBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
+		return req, nil
+	})
 	if err != nil {
 		return fmt.Errorf("agree submit: %w", err)
 	}
@@ -332,12 +345,14 @@ func (c *portalClient) getJSONP(ctx context.Context, endpoint string, values url
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithRetry(ctx, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GdouNetGuard/1.3.0")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +369,6 @@ func (c *portalClient) getJSONP(ctx context.Context, endpoint string, values url
 
 // ---- protocol crypto ----
 
-// BuildLoginParams builds the SRUN login form parameters.
 func BuildLoginParams(username, password, ip, acid, token string) (url.Values, error) {
 	const (
 		encVer = "srun_bx1"
@@ -491,7 +505,6 @@ func sha1Hex(message string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// UnwrapJSONP strips the JSONP callback wrapper from a response body.
 func UnwrapJSONP(body []byte) ([]byte, error) {
 	text := strings.TrimSpace(string(body))
 	if strings.HasPrefix(text, "{") {
